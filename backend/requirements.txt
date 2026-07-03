@@ -1,0 +1,24 @@
+# Modal serverless backend dependencies
+# These are installed inside the Modal container image, not locally.
+
+# Background removal (CPU)
+rembg[gpu]==2.0.57
+onnxruntime==1.19.2
+
+# Pose detection (CPU)
+mediapipe==0.10.18
+opencv-python-headless==4.10.0.84
+
+# Image processing
+Pillow==10.4.0
+numpy==1.26.4
+
+# CatVTON dependencies (GPU function)
+torch==2.4.1
+torchvision==0.19.1
+diffusers==0.30.3
+transformers==4.44.2
+accelerate==0.34.2
+huggingface-hub==0.25.2
+safetensors==0.4.5
+einops==0.8.0
