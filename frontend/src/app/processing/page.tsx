@@ -81,7 +81,7 @@ export default function ProcessingPage() {
         </div>
 
         <p className="text-sm text-[#171717]/40">
-          This may take up to 2 minutes on first run while the AI model warms up.
+          This may take up to 3 minutes on first run while the AI model warms up.
         </p>
       </div>
     </div>
