@@ -41,8 +41,41 @@ cpu_image = (
     )
 )
 
-# GPU image for CatVTON — will be defined in Phase 2
-# gpu_image = (...)
+def download_catvton_models():
+    from huggingface_hub import snapshot_download
+    snapshot_download(repo_id="zhengchong/CatVTON")
+    snapshot_download(repo_id="booksforcharlie/stable-diffusion-inpainting")
+
+# GPU image for CatVTON
+gpu_image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .apt_install("git", "libgl1-mesa-glx", "libglib2.0-0")
+    .pip_install(
+        "fastapi[standard]",
+        "torch==2.4.0",
+        "torchvision==0.19.0",
+        "accelerate>=0.31.0",
+        "transformers==4.46.3",
+        "pillow==10.3.0",
+        "numpy==1.26.4",
+        "opencv_python==4.10.0.84",
+        "scipy==1.13.1",
+        "scikit-image==0.24.0",
+        "peft>=0.17.0",
+        "fvcore",
+        "iopath",
+        "omegaconf",
+        "cloudpickle",
+        "pycocotools",
+        "av",
+        "matplotlib",
+        "setuptools>=51.0.0",
+        "huggingface_hub>=0.34.0",
+        "diffusers==0.30.0"
+    )
+    .run_function(download_catvton_models)
+    .add_local_dir("backend/CatVTON", remote_path="/root/CatVTON")
+)
 
 
 # ---------------------------------------------------------------------------
@@ -53,6 +86,105 @@ cpu_image = (
 def hello():
     """Simple test function to confirm Modal deployment is working."""
     return "✅ NextGen Virtual Try-On backend is live on Modal!"
+
+
+# ---------------------------------------------------------------------------
+# Stage 3: Virtual Try-On Generation (CatVTON, GPU)
+# ---------------------------------------------------------------------------
+
+@app.cls(
+    image=gpu_image,
+    gpu="A10G",
+    timeout=600,
+    scaledown_window=240,
+)
+class CatVTONService:
+    @modal.enter()
+    def load_model(self):
+        import sys
+        sys.path.append("/root/CatVTON")
+        import torch
+        import os
+        from huggingface_hub import snapshot_download
+        from model.pipeline import CatVTONPipeline
+        from diffusers.image_processor import VaeImageProcessor
+        from model.cloth_masker import AutoMasker
+
+        repo_path = snapshot_download(repo_id="zhengchong/CatVTON")
+        
+        self.pipeline = CatVTONPipeline(
+            base_ckpt="booksforcharlie/stable-diffusion-inpainting",
+            attn_ckpt=repo_path,
+            attn_ckpt_version="mix",
+            weight_dtype=torch.bfloat16,
+            use_tf32=True,
+            device='cuda',
+            skip_safety_check=True,
+        )
+        
+        self.mask_processor = VaeImageProcessor(
+            vae_scale_factor=8, do_normalize=False, do_binarize=True, do_convert_grayscale=True
+        )
+        self.automasker = AutoMasker(
+            densepose_ckpt=os.path.join(repo_path, "DensePose"),
+            schp_ckpt=os.path.join(repo_path, "SCHP"),
+            device='cuda',
+        )
+
+    @modal.method()
+    def generate(self, person_bytes: bytes, cloth_bytes: bytes, cloth_type: str = "upper") -> bytes:
+        import io
+        import torch
+        from PIL import Image
+        import sys
+        sys.path.append("/root/CatVTON")
+        from utils import resize_and_crop, resize_and_padding
+
+        person_image = Image.open(io.BytesIO(person_bytes)).convert("RGB")
+        
+        # Use pure white (255, 255, 255) as CatVTON expects strict e-commerce backgrounds
+        bg_color = (255, 255, 255)
+        cloth_img_raw = Image.open(io.BytesIO(cloth_bytes))
+        if cloth_img_raw.mode in ('RGBA', 'LA') or (cloth_img_raw.mode == 'P' and 'transparency' in cloth_img_raw.info):
+            cloth_image = Image.new("RGB", cloth_img_raw.size, bg_color)
+            if cloth_img_raw.mode == 'RGBA':
+                cloth_image.paste(cloth_img_raw, mask=cloth_img_raw.split()[3])
+            else:
+                cloth_image.paste(cloth_img_raw.convert("RGBA"), mask=cloth_img_raw.convert("RGBA").split()[3])
+        else:
+            cloth_image = cloth_img_raw.convert("RGB")
+        
+        width, height = 768, 1024
+        person_image = resize_and_crop(person_image, (width, height))
+        cloth_image = resize_and_padding(cloth_image, (width, height))
+
+        # Generate Mask automatically
+        mask_result = self.automasker(person_image, cloth_type)
+        mask = mask_result['mask']
+        mask = self.mask_processor.blur(mask, blur_factor=5)
+        
+        # Inference — all CatVTON defaults for maximum quality
+        # guidance_scale=2.5: CatVTON default
+        # eta=1.0: CatVTON was trained with stochastic DDIM (eta=1.0), NOT deterministic (eta=0.0)
+        #          Using 0.0 constrains the denoiser too much and causes color drift
+        result_image = self.pipeline(
+            image=person_image,
+            condition_image=cloth_image,
+            mask=mask,
+            num_inference_steps=75,
+            guidance_scale=2.5,
+            generator=None,
+        )[0]
+        
+        # Repaint the result: paste the generated garment back onto the original resized person image
+        # using the mask. This keeps the person's face, hair, hands, and background 100% original
+        # and crisp, while only updating the clothing.
+        from utils import repaint_result
+        final_image = repaint_result(result_image, person_image, mask)
+        
+        out_buffer = io.BytesIO()
+        final_image.save(out_buffer, format="PNG")
+        return out_buffer.getvalue()
 
 
 # ---------------------------------------------------------------------------
@@ -255,107 +387,97 @@ def _generate_agnostic_mask(landmarks, width: int, height: int) -> "np.ndarray":
 
 
 # ---------------------------------------------------------------------------
-# Web Endpoint — Full pipeline orchestration (expanded in Phase 2)
+# Stage 4: Background Job Function
 # ---------------------------------------------------------------------------
 
-@app.function(image=cpu_image, timeout=300)
+@app.function(image=cpu_image, timeout=1800)
+def tryon_job(person_bytes: bytes, garment_bytes: bytes, bottom_bytes: bytes | None, mode: str, tuck_in: bool) -> dict:
+    try:
+        # 1. Pose estimation (to ensure valid person)
+        pose_result = analyze_pose.remote(person_bytes)
+        if not pose_result.get("person_detected", False):
+            return {"success": False, "error": "Could not detect a person in the image. Please try a clearer full-body photo."}
+        
+        if mode == "single":
+            # Pass raw garment directly. Running remove_background can accidentally 
+            # erase parts of white garments or thin fabrics.
+            final_bytes = CatVTONService().generate.remote(person_bytes, garment_bytes, cloth_type="upper")
+        else:
+            # Process top then bottom
+            mid_bytes = CatVTONService().generate.remote(person_bytes, garment_bytes, cloth_type="upper")
+            final_bytes = CatVTONService().generate.remote(mid_bytes, bottom_bytes, cloth_type="lower")
+            
+        return {
+            "success": True,
+            "result_image": base64.b64encode(final_bytes).decode("utf-8")
+        }
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return {"success": False, "error": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# Web Endpoints — Full pipeline orchestration with Polling
+# ---------------------------------------------------------------------------
+
+import fastapi
+from fastapi.responses import JSONResponse
+
+@app.function(image=cpu_image)
 @modal.fastapi_endpoint(method="POST")
-async def tryon_endpoint(request: "fastapi.Request"):
-    """
-    Main API endpoint for the virtual try-on pipeline.
-
-    Accepts multipart form data:
-      - person_image: file (required)
-      - mode: "single" | "complete_outfit" (required)
-      - garment_image: file (required if mode="single")
-      - top_image: file (required if mode="complete_outfit")
-      - bottom_image: file (required if mode="complete_outfit")
-      - tuck_in: "true" | "false" (optional)
-
-    Returns:
-      - JSON with result_image (base64) on success
-      - JSON with error message on failure
-    """
-    from fastapi.responses import JSONResponse
-
+async def tryon(request: fastapi.Request):
     try:
         form = await request.form()
-
-        # --- Validate required fields ---
         mode = form.get("mode", "single")
-        if mode not in ("single", "complete_outfit"):
-            return JSONResponse(
-                {"error": "Invalid mode. Must be 'single' or 'complete_outfit'."},
-                status_code=400,
-            )
-
         person_file = form.get("person_image")
+        
         if not person_file:
-            return JSONResponse(
-                {"error": "person_image is required."},
-                status_code=400,
-            )
+            return JSONResponse({"error": "person_image is required."}, status_code=400)
         person_bytes = await person_file.read()
 
         tuck_in = form.get("tuck_in", "false") == "true"
 
-        # --- Get garment image(s) based on mode ---
         if mode == "single":
             garment_file = form.get("garment_image")
             if not garment_file:
-                return JSONResponse(
-                    {"error": "garment_image is required for single mode."},
-                    status_code=400,
-                )
+                return JSONResponse({"error": "garment_image is required."}, status_code=400)
             garment_bytes = await garment_file.read()
+            bottom_bytes = None
         else:
             top_file = form.get("top_image")
             bottom_file = form.get("bottom_image")
             if not top_file or not bottom_file:
-                return JSONResponse(
-                    {"error": "top_image and bottom_image are required for complete_outfit mode."},
-                    status_code=400,
-                )
-            top_bytes = await top_file.read()
+                return JSONResponse({"error": "top_image and bottom_image required."}, status_code=400)
+            garment_bytes = await top_file.read()
             bottom_bytes = await bottom_file.read()
 
-        # --- Stage 1: Remove garment background(s) ---
-        if mode == "single":
-            garment_clean = remove_background.remote(garment_bytes)
-        else:
-            # Process top and bottom garments in parallel
-            garment_top_future = remove_background.spawn(top_bytes)
-            garment_bottom_future = remove_background.spawn(bottom_bytes)
-            garment_top_clean = garment_top_future.get()
-            garment_bottom_clean = garment_bottom_future.get()
-
-        # --- Stage 2: Analyze pose ---
-        pose_result = analyze_pose.remote(person_bytes)
-
-        if not pose_result.get("person_detected", False):
-            return JSONResponse(
-                {"error": pose_result.get("error", "No person detected in the image.")},
-                status_code=400,
-            )
-
-        # --- Stage 3: CatVTON generation (Phase 2) ---
-        # TODO: Wire up generate_tryon function in Phase 2
-        # For now, return a placeholder response confirming pipeline stages work
-        return JSONResponse({
-            "status": "pipeline_stages_ok",
-            "message": "Stages 1 & 2 completed successfully. CatVTON generation (Stage 3) will be wired in Phase 2.",
-            "mode": mode,
-            "tuck_in": tuck_in,
-            "person_detected": True,
-            "pose_keypoints_count": len(pose_result.get("keypoints", [])),
-            "image_dimensions": f"{pose_result['image_width']}x{pose_result['image_height']}",
-        })
-
+        # Spawn the job in the background and return the job ID
+        call = tryon_job.spawn(person_bytes, garment_bytes, bottom_bytes, mode, tuck_in)
+        
+        return JSONResponse({"status": "processing", "job_id": call.object_id})
     except Exception as e:
-        return JSONResponse(
-            {"error": f"Pipeline failed: {str(e)}"},
-            status_code=500,
-        )
+        return JSONResponse({"error": f"Failed to start job: {str(e)}"}, status_code=500)
+
+
+@app.function(image=cpu_image)
+@modal.fastapi_endpoint(method="GET")
+def status(job_id: str):
+    from modal.functions import FunctionCall
+    try:
+        call = FunctionCall.from_id(job_id)
+        try:
+            result = call.get(timeout=0) # Non-blocking check
+            if result.get("success"):
+                return JSONResponse({"status": "completed", "result_image": result["result_image"]})
+            else:
+                return JSONResponse({"status": "error", "error": result.get("error", "Unknown error")})
+        except TimeoutError:
+            return JSONResponse({"status": "processing"})
+        except Exception as e:
+            return JSONResponse({"status": "error", "error": str(e)})
+    except Exception as e:
+        return JSONResponse({"status": "error", "error": f"Invalid job ID or expired: {str(e)}"})
 
 
 # ---------------------------------------------------------------------------

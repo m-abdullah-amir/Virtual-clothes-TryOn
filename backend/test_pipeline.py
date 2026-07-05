@@ -13,7 +13,7 @@ Usage:
     # Test pose analysis with a sample image
     python backend/test_pipeline.py --stage pose --image path/to/person.jpg
 
-    # Test full pipeline (once Phase 2 is complete)
+    # Test full pipeline (HTTP endpoint)
     python backend/test_pipeline.py --stage full --person path/to/person.jpg --garment path/to/garment.jpg
 """
 
@@ -89,6 +89,56 @@ def test_hello():
     print(f"🎉 {result}")
 
 
+def test_full(person_path: str, garment_path: str):
+    """Test the full end-to-end pipeline via the HTTP endpoint."""
+    import requests
+    import base64
+
+    url = "https://m-abdullah-amir--virtual-tryon-tryon-endpoint.modal.run"
+
+    print(f"📤 Sending request to {url}...")
+    print("   (First call may take 3-5 mins while GPU warms up — please be patient)")
+
+    with open(person_path, "rb") as p_file, open(garment_path, "rb") as g_file:
+        files = {
+            "person_image": (os.path.basename(person_path), p_file, "image/png"),
+            "garment_image": (os.path.basename(garment_path), g_file, "image/jpeg"),
+        }
+        data = {
+            "mode": "single",
+            "category": "upper",
+            "tuck_in": "false",
+        }
+
+        response = requests.post(url, files=files, data=data, timeout=1200)
+
+    if response.status_code != 200:
+        print(f"❌ Error {response.status_code}: {response.text}")
+        return
+
+    result = response.json()
+
+    # Check for success (backend now returns {"success": True, "result_image": "..."})
+    if not result.get("success"):
+        print(f"❌ Pipeline failed: {result}")
+        return
+
+    print("✅ Full pipeline succeeded!")
+
+    # Decode and save the result image
+    result_b64 = result.get("result_image")
+    if not result_b64:
+        print(f"❌ No result_image in response: {result}")
+        return
+
+    output_path = "full_pipeline_result.png"
+    with open(output_path, "wb") as f:
+        f.write(base64.b64decode(result_b64))
+
+    print(f"   Result image saved to: {output_path}")
+    print(f"   Image size: {os.path.getsize(output_path):,} bytes")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Test Virtual Try-On pipeline stages")
     parser.add_argument(
@@ -119,7 +169,7 @@ def main():
         if not args.person or not args.garment:
             print("❌ --person and --garment are required for full test")
             sys.exit(1)
-        print("⏳ Full pipeline test will be available after Phase 2.")
+        test_full(args.person, args.garment)
 
 
 if __name__ == "__main__":
